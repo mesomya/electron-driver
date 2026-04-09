@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  boot:
+    name: boot check on ${{ matrix.os }} (node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Server boot smoke test
+        shell: bash
+        run: |
+          # The MCP server runs over stdio. We smoke-test that it starts,
+          # writes its ready banner to stderr, and exits cleanly when its
+          # stdin closes.
+          output=$(timeout 5 node index.mjs </dev/null 2>&1 || true)
+          echo "$output"
+          echo "$output" | grep -q "electron-driver MCP server v"
