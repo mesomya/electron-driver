@@ -1,0 +1,9 @@
+# `files` in package.json is the source of truth for what gets published.
+# This file exists as a safety net for anything slipped in by tooling.
+node_modules/
+.electron-driver/
+*.log
+.git/
+.github/
+.vscode/
+.idea/

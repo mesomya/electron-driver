@@ -1,0 +1,9 @@
+node_modules/
+.electron-driver/
+*.log
+*.env
+*.env.*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

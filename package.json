@@ -1,0 +1,51 @@
+{
+  "name": "electron-driver",
+  "version": "0.3.0",
+  "description": "MCP server that lets AI agents drive Electron apps — click, type, drag, screenshot, eval JS in the renderer or main process, capture console logs, handle multi-window apps, and more.",
+  "type": "module",
+  "bin": {
+    "electron-driver": "./index.mjs"
+  },
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "keywords": [
+    "electron",
+    "mcp",
+    "model-context-protocol",
+    "playwright",
+    "ai-agent",
+    "claude",
+    "claude-code",
+    "testing",
+    "automation",
+    "e2e",
+    "visual-testing",
+    "agent-tools",
+    "desktop-automation"
+  ],
+  "author": "mesomya",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mesomya/electron-driver.git"
+  },
+  "homepage": "https://github.com/mesomya/electron-driver#readme",
+  "bugs": {
+    "url": "https://github.com/mesomya/electron-driver/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "playwright": "^1.59.1"
+  }
+}
