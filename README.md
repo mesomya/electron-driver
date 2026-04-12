@@ -10,7 +10,7 @@ handle multi-window apps, capture accessibility snapshots — all through an
 MCP (Model Context Protocol) server that plugs into Claude Code, Claude
 Desktop, Cursor, and any other MCP-compatible agent host.
 
-https://github.com/mesomya/electron-driver/raw/main/assets/demo.mp4
+https://github.com/user-attachments/assets/a95500d2-28d2-4ee1-9965-8f7e1ef54caa
 
 Built on Playwright's experimental `_electron` API. Works with any Electron
 app — React, Vue, Svelte, vanilla — as long as you can point it at a
