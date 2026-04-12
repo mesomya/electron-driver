@@ -1845,9 +1845,47 @@ const tools = {
 
 // ---- MCP wiring --------------------------------------------------------
 
+const SERVER_INSTRUCTIONS = `
+electron-driver lets you drive an Electron desktop app — click, type, drag, screenshot, evaluate JS, and more.
+
+## How to use this server
+
+1. **start_app** first. Pass the absolute path to the built main-process entry (e.g. out/main/index.js). The app must be built before starting — run the project's build command via Bash if needed.
+
+2. **snapshot** to see what's on screen. This returns a numbered list of visible interactive elements:
+   [1] button "Open File"
+   [2] button "Settings"
+   [3] heading "Welcome"
+   Use these ref numbers with click, type, hover, get_text, and other tools instead of guessing selectors.
+
+3. **Interact by ref number.** After a snapshot, call click({ref: 2}) instead of click({selector: "text=Settings"}). This eliminates selector-guessing round-trips and is much faster.
+
+4. **screenshot** when you need to visually verify something. Use Read to view the saved PNG. Snapshots are for navigation; screenshots are for visual confirmation.
+
+5. **stop_app** when done. Never leave the app running.
+
+## Key patterns
+
+- **Navigation:** snapshot → click by ref → snapshot again after page change
+- **Visual check:** screenshot → Read the PNG → judge visually
+- **Read DOM state:** get_text, get_attribute, get_value, get_bbox, get_computed_style, exists — all accept ref or selector
+- **Forms:** type (fill), keyboard_type (real keystrokes), select_option, check/uncheck, clear_input, set_input_files
+- **Wait for state:** wait_for_selector or wait_for (predicate) — prefer these over fixed wait()
+- **Debug:** console_logs, eval_renderer, eval_main
+- **Native dialogs are invisible** — use eval_main to invoke IPC handlers directly, or dialog_handler for JS alert/confirm/prompt
+- **Multi-window:** windows_list → switch_window by index or title
+
+## Common mistakes to avoid
+
+- Do NOT guess selectors without calling snapshot first. Snapshot tells you exactly what's on screen.
+- Do NOT use screenshot for navigation. Screenshots are expensive (PNG read + visual reasoning). Use snapshot (fast text) for finding elements, screenshots only for visual verification.
+- Do NOT forget to stop_app. Orphaned Electron processes waste resources.
+- Do NOT try to interact with native OS file dialogs — they're invisible to this driver. Use eval_main to invoke the app's own file-opening IPC instead.
+`.trim()
+
 const server = new Server(
   { name: 'electron-driver', version: '0.3.0' },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS }
 )
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
