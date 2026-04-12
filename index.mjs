@@ -15,6 +15,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { _electron as electron } from 'playwright'
 import { mkdirSync, rmSync, existsSync, appendFileSync, readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 
 // ---- Session state -----------------------------------------------------
@@ -97,6 +98,49 @@ function findProjectRoot(startDir) {
     dir = parent
   }
   return startDir
+}
+
+// Resolve the path to the Electron binary from the project under test.
+// When the driver runs as a standalone package (npx electron-driver, global
+// install, etc.), Playwright's _electron.launch() tries require('electron')
+// from the DRIVER's node_modules — which doesn't have electron because it's
+// a devDependency of the PROJECT, not the driver. This function looks for
+// electron in the project's node_modules and returns the executable path.
+function resolveElectronBinary(projectDir, userExecPath) {
+  // User-provided path takes priority.
+  if (userExecPath) {
+    if (!existsSync(userExecPath)) {
+      throw new Error(`executablePath not found: ${userExecPath}`)
+    }
+    return userExecPath
+  }
+
+  // Walk up from projectDir looking for node_modules/electron.
+  const searchDirs = [projectDir]
+  // Also look in common parent patterns: if main is at out/main/index.js,
+  // projectDir might be out/ — the real project root is likely up one or two levels.
+  let d = projectDir
+  for (let i = 0; i < 5; i++) {
+    const parent = path.dirname(d)
+    if (parent === d) break
+    searchDirs.push(parent)
+    d = parent
+  }
+
+  for (const dir of searchDirs) {
+    try {
+      const req = createRequire(path.join(dir, 'package.json'))
+      const electronPath = req('electron')
+      if (electronPath && typeof electronPath === 'string') {
+        log('electron-binary-resolved', { from: dir, path: electronPath })
+        return electronPath
+      }
+    } catch {
+      // Not found in this dir, try next.
+    }
+  }
+
+  return null // Let Playwright try its own resolution; may still work.
 }
 
 // Rewrite Playwright error messages so they're attributed to the driver tool
@@ -384,10 +428,15 @@ const tools = {
           type: 'number',
           description: 'Launch timeout in milliseconds. Default 30000.',
         },
+        executablePath: {
+          type: 'string',
+          description:
+            'Absolute path to the Electron binary. Usually not needed — the driver auto-resolves it from the project\'s node_modules. Override if auto-resolution fails (e.g. custom Electron fork, monorepo layout).',
+        },
       },
       required: ['main'],
     },
-    handler: async ({ main, cwd, args = [], screenshotsDir, env, timeoutMs }) => {
+    handler: async ({ main, cwd, args = [], screenshotsDir, env, timeoutMs, executablePath: userExecPath }) => {
       if (app) {
         return err(
           'An Electron app is already running. Call stop_app first.',
@@ -416,15 +465,30 @@ const tools = {
       shotCounter = 0
       consoleBuffer = []
 
-      log('launching', { main, cwd: resolvedCwd })
+      // Resolve the Electron binary from the project's node_modules so the
+      // driver works as a standalone package (npx, global install) without
+      // requiring electron as its own dependency.
+      let electronBinary
+      try {
+        electronBinary = resolveElectronBinary(resolvedCwd, userExecPath)
+      } catch (e) {
+        return err(e.message, 'FILE_NOT_FOUND')
+      }
+
+      const launchOpts = {
+        args: [main, ...args],
+        cwd: resolvedCwd,
+        env: { ...process.env, ...(env || {}) },
+        timeout: timeoutMs ?? 30000,
+      }
+      if (electronBinary) {
+        launchOpts.executablePath = electronBinary
+      }
+
+      log('launching', { main, cwd: resolvedCwd, electronBinary: electronBinary || 'auto' })
       const launchStart = Date.now()
       try {
-        app = await electron.launch({
-          args: [main, ...args],
-          cwd: resolvedCwd,
-          env: { ...process.env, ...(env || {}) },
-          timeout: timeoutMs ?? 30000,
-        })
+        app = await electron.launch(launchOpts)
       } catch (e) {
         const elapsed = Date.now() - launchStart
         const message = diagnoseLaunchError(e, elapsed)
