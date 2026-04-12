@@ -360,6 +360,33 @@ when debugging why an agent got stuck.
 where `<project>` is the nearest directory containing `.git` or
 `package.json`. Override via `screenshotsDir` on `start_app`.
 
+## Security
+
+**This server gives the connected agent full control over an Electron app,
+including arbitrary code execution in the main process (via `eval_main`).** The
+Electron main process has unrestricted Node.js access — filesystem, network,
+child processes, everything. This is by design: it's what makes the driver
+powerful enough to drive real apps.
+
+What this means for you:
+
+- **Only use over stdio** (the default). Never expose this server over HTTP,
+  WebSocket, or any network transport. Stdio ties it to the process that
+  spawned it — your local Claude Code or Claude Desktop session.
+- **Trust the agent.** The agent calling these tools can do anything on
+  your machine via `eval_main`. Only connect agents you trust.
+- **Don't use in multi-tenant environments.** This is a single-user,
+  local-machine tool. It's not designed for shared servers, CI pipelines
+  with untrusted input, or any context where the caller might be
+  adversarial.
+- **`drop_file` and `set_input_files` read local files** and pass their
+  contents to the renderer. The file paths should come from trusted sources.
+
+If you're running this with Claude Code, the risk profile is the same as
+giving Claude Code terminal access (which you already have). The driver
+doesn't add new capabilities beyond what `eval` in a terminal could do —
+it just makes them convenient for the agent to use.
+
 ## Known limitations
 
 - Playwright's `_electron` namespace is officially experimental upstream.
