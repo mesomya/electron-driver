@@ -31,6 +31,7 @@
     "agent-tools",
     "desktop-automation"
   ],
+  "mcpName": "io.github.mesomya/electron-driver",
   "author": "mesomya",
   "license": "MIT",
   "repository": {
