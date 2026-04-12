@@ -32,6 +32,12 @@ let logFile = null
 const CONSOLE_BUFFER_MAX = 1000
 let consoleBuffer = []
 
+// Ref map: snapshot assigns integer refs to elements. Interaction tools
+// can accept a ref instead of a selector, eliminating selector-guessing
+// round-trips. Cleared on each snapshot() or start_app().
+let refMap = {} // { refId: selectorString }
+let refCounter = 0
+
 // ---- Logging -----------------------------------------------------------
 
 function initLogDir(baseDir) {
@@ -187,6 +193,27 @@ const ARG_SCHEMA = {
   type: ['object', 'array', 'string', 'number', 'boolean', 'null'],
   description:
     'Arbitrary JSON-serializable value exposed as `arg` inside the body. Objects, arrays, primitives, and null all work.',
+}
+
+// Resolve a user-provided selector OR ref to an actual selector string.
+// If `ref` is given (a number), look it up in the refMap from the last
+// snapshot. If `selector` is given, use it directly. If both are given,
+// ref takes priority. Throws with a clear error if ref is unknown.
+function resolveSelector(selector, ref) {
+  if (ref !== undefined && ref !== null) {
+    const r = Number(ref)
+    const sel = refMap[r]
+    if (!sel) {
+      throw new Error(
+        `ref ${r} not found. Call snapshot first to assign refs, then use a ref from that result.`
+      )
+    }
+    return sel
+  }
+  if (!selector) {
+    throw new Error('Either selector or ref is required.')
+  }
+  return selector
 }
 
 function assertPoint(label, pt) {
@@ -464,6 +491,8 @@ const tools = {
       mkdirSync(shotsDir, { recursive: true })
       shotCounter = 0
       consoleBuffer = []
+      refMap = {}
+      refCounter = 0
 
       // Resolve the Electron binary from the project's node_modules so the
       // driver works as a standalone package (npx, global install) without
@@ -584,6 +613,165 @@ const tools = {
     },
   },
 
+  snapshot: {
+    description:
+      'Return a structured text representation of the visible page with numbered refs. Each interactive or labelled element gets a [ref] number that can be passed to click, type, hover, get_text, and other tools instead of a selector — eliminating selector-guessing round-trips. Call this FIRST before interacting with a page to see what is on screen. The snapshot is an accessibility-tree-based representation similar to Playwright MCP\'s browser_snapshot.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        selector: {
+          type: 'string',
+          description: 'Optional root selector. If given, only snapshot that subtree.',
+        },
+      },
+    },
+    handler: async ({ selector } = {}) => {
+      requireApp()
+
+      // Clear previous refs.
+      refMap = {}
+      refCounter = 0
+
+      // Walk the visible DOM and build a text representation with refs.
+      const snapshot = await win.evaluate((rootSel) => {
+        const root = rootSel ? document.querySelector(rootSel) : document.body
+        if (!root) return { text: '(no root element found)', elements: [] }
+
+        const lines = []
+        const elements = []
+        let counter = 0
+
+        // Which elements are "interesting" enough to get a ref number?
+        const INTERACTIVE_TAGS = new Set([
+          'A', 'BUTTON', 'INPUT', 'TEXTAREA', 'SELECT', 'DETAILS', 'SUMMARY',
+        ])
+        const INTERACTIVE_ROLES = new Set([
+          'button', 'link', 'checkbox', 'radio', 'tab', 'menuitem', 'option',
+          'switch', 'textbox', 'combobox', 'searchbox', 'slider', 'spinbutton',
+          'treeitem',
+        ])
+
+        function isInteractive(el) {
+          if (INTERACTIVE_TAGS.has(el.tagName)) return true
+          const role = el.getAttribute('role')
+          if (role && INTERACTIVE_ROLES.has(role)) return true
+          if (el.getAttribute('tabindex') !== null) return true
+          if (el.getAttribute('contenteditable') === 'true') return true
+          if (el.onclick || el.onpointerdown || el.onmousedown) return true
+          // React handler check
+          const hasReactHandler = Object.keys(el).some(
+            k => k.startsWith('__reactProps') || k.startsWith('__reactEvents')
+          )
+          if (hasReactHandler) {
+            const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps'))
+            if (propsKey) {
+              const p = el[propsKey]
+              if (p?.onClick || p?.onPointerDown || p?.onMouseDown || p?.onChange) return true
+            }
+          }
+          return false
+        }
+
+        function isVisible(el) {
+          if (!el.offsetParent && el.tagName !== 'BODY' && el.tagName !== 'HTML') return false
+          const style = getComputedStyle(el)
+          if (style.display === 'none' || style.visibility === 'hidden') return false
+          if (parseFloat(style.opacity) === 0) return false
+          return true
+        }
+
+        function walk(el, depth) {
+          if (!isVisible(el)) return
+          const tag = el.tagName.toLowerCase()
+
+          // Skip noise
+          if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'svg') return
+
+          const interactive = isInteractive(el)
+          const role = el.getAttribute('role')
+          const ariaLabel = el.getAttribute('aria-label')
+          const text = el.textContent?.trim().slice(0, 80) || ''
+          const isHeading = /^h[1-6]$/.test(tag)
+          const isImg = tag === 'img'
+
+          // Assign ref to interactive elements and headings
+          if (interactive || isHeading || isImg) {
+            counter++
+            const ref = counter
+            const indent = '  '.repeat(depth)
+
+            let desc = ''
+            if (isHeading) {
+              desc = `${tag} "${text}"`
+            } else if (isImg) {
+              desc = `img "${el.getAttribute('alt') || ''}"`
+            } else if (tag === 'input') {
+              const type = el.getAttribute('type') || 'text'
+              const val = el.value || ''
+              const placeholder = el.getAttribute('placeholder') || ''
+              desc = `input[${type}]${placeholder ? ' placeholder="' + placeholder + '"' : ''}${val ? ' value="' + val + '"' : ''}`
+            } else if (tag === 'textarea') {
+              desc = `textarea "${(el.value || '').slice(0, 40)}"`
+            } else if (tag === 'select') {
+              const selected = el.options?.[el.selectedIndex]?.text || ''
+              desc = `select "${selected}"`
+            } else {
+              const displayRole = role || tag
+              const displayText = ariaLabel || text.slice(0, 50)
+              desc = `${displayRole}${displayText ? ' "' + displayText + '"' : ''}`
+            }
+
+            lines.push(`${indent}[${ref}] ${desc}`)
+
+            // Build a unique selector for this element
+            let selector = ''
+            if (el.id) {
+              selector = `#${CSS.escape(el.id)}`
+            } else if (ariaLabel) {
+              selector = `[aria-label="${ariaLabel.replace(/"/g, '\\"')}"]`
+            } else if (tag === 'button' || tag === 'a') {
+              const shortText = text.slice(0, 30)
+              if (shortText) selector = `${tag}:has-text("${shortText.replace(/"/g, '\\"')}")`
+            }
+            if (!selector) {
+              // Fallback: nth-of-type path
+              const parent = el.parentElement
+              if (parent) {
+                const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName)
+                const idx = siblings.indexOf(el)
+                selector = `${tag}:nth-of-type(${idx + 1})`
+              } else {
+                selector = tag
+              }
+            }
+
+            elements.push({ ref, tag, text: text.slice(0, 50), selector })
+          }
+
+          // Recurse into children
+          for (const child of el.children) {
+            walk(child, interactive || isHeading ? depth + 1 : depth)
+          }
+        }
+
+        walk(root, 0)
+        return { text: lines.join('\n'), elements }
+      }, selector || null)
+
+      // Populate the ref map so subsequent tool calls can use refs.
+      for (const el of snapshot.elements || []) {
+        refMap[el.ref] = el.selector
+        refCounter = Math.max(refCounter, el.ref)
+      }
+
+      return ok({
+        snapshot: snapshot.text,
+        refCount: snapshot.elements?.length || 0,
+        hint: 'Use ref numbers with click, type, hover, get_text, and other tools. E.g. click({ref: 3}) instead of click({selector: "..."})',
+      })
+    },
+  },
+
   screenshot: {
     description:
       'Capture a full-page PNG of the current window. Returns the absolute path. Pass `name` to control the filename (without extension).',
@@ -619,11 +807,12 @@ const tools = {
 
   click: {
     description:
-      'Click an element matching a Playwright selector. Supports CSS, text=, [aria-label=...], role selectors, etc. Pass `force: true` to skip actionability checks when an overlay is in the way.',
+      'Click an element. Pass `selector` (Playwright selector) or `ref` (from a snapshot). Pass `force: true` to skip actionability checks when an overlay is in the way.',
     inputSchema: {
       type: 'object',
       properties: {
-        selector: { type: 'string' },
+        selector: { type: 'string', description: 'Playwright selector. Alternative to ref.' },
+        ref: { type: 'number', description: 'Ref number from a snapshot call. Alternative to selector.' },
         timeoutMs: { type: 'number', description: 'Default 5000.' },
         button: {
           type: 'string',
@@ -647,6 +836,7 @@ const tools = {
     },
     handler: async ({
       selector,
+      ref,
       timeoutMs,
       button = 'left',
       clickCount = 1,
@@ -654,30 +844,33 @@ const tools = {
       position,
     }) => {
       requireApp()
+      const sel = resolveSelector(selector, ref)
       const timeout = coerceTimeout(timeoutMs, 5000)
       const opts = { timeout, button, clickCount, force }
       if (position) opts.position = position
-      await win.click(selector, opts)
+      await win.click(sel, opts)
       return ok()
     },
   },
 
   type: {
     description:
-      "Fill a text input matching a selector, REPLACING existing content. Uses Playwright's `fill`, which is fast but only works on real <input>/<textarea>/[contenteditable] elements. For keyboard-level typing (shortcuts, CodeMirror, contenteditables, or appending to existing text), use `keyboard_type` instead.",
+      "Fill a text input, REPLACING existing content. Pass `selector` or `ref`. Uses Playwright's `fill`. For keyboard-level typing (CodeMirror, contenteditables), use `keyboard_type` instead.",
     inputSchema: {
       type: 'object',
       properties: {
         selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot. Alternative to selector.' },
         text: { type: 'string' },
         timeoutMs: { type: 'number', description: 'Default 5000.' },
       },
-      required: ['selector', 'text'],
+      required: ['text'],
     },
-    handler: async ({ selector, text, timeoutMs }) => {
+    handler: async ({ selector, ref, text, timeoutMs }) => {
       requireApp()
+      const sel = resolveSelector(selector, ref)
       const timeout = coerceTimeout(timeoutMs, 5000)
-      await win.fill(selector, text, { timeout })
+      await win.fill(sel, text, { timeout })
       return ok()
     },
   },
@@ -767,11 +960,12 @@ const tools = {
 
   hover: {
     description:
-      'Hover the mouse over an element matching a selector. Pass `force: true` to skip Playwright\'s actionability checks — useful when a tooltip, backdrop, or transient overlay intercepts pointer events and you want to hover anyway.',
+      'Hover the mouse over an element. Pass `selector` or `ref`. Pass `force: true` to skip actionability checks when an overlay intercepts.',
     inputSchema: {
       type: 'object',
       properties: {
         selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot. Alternative to selector.' },
         timeoutMs: { type: 'number', description: 'Default 5000.' },
         force: {
           type: 'boolean',
@@ -781,10 +975,11 @@ const tools = {
       },
       required: ['selector'],
     },
-    handler: async ({ selector, timeoutMs, force = false }) => {
+    handler: async ({ selector, ref, timeoutMs, force = false }) => {
       requireApp()
+      const sel = resolveSelector(selector, ref)
       const timeout = coerceTimeout(timeoutMs, 5000)
-      await win.hover(selector, { timeout, force })
+      await win.hover(sel, { timeout, force })
       return ok()
     },
   },
@@ -968,35 +1163,38 @@ const tools = {
 
   exists: {
     description:
-      'Fast check for whether any element matches a selector, plus the count. Uses Playwright locators so it accepts the full selector engine (CSS, text=, role=, :has-text(), etc). Does not wait. Returns { exists, count }.',
+      'Fast check for whether any element matches, plus the count. Pass `selector` or `ref`. Does not wait.',
     inputSchema: {
       type: 'object',
       properties: {
         selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot.' },
       },
-      required: ['selector'],
     },
-    handler: async ({ selector }) => {
+    handler: async ({ selector, ref }) => {
       requireApp()
-      const count = await win.locator(selector).count()
+      const sel = resolveSelector(selector, ref)
+      const count = await win.locator(sel).count()
       return ok({ exists: count > 0, count })
     },
   },
 
   get_attribute: {
     description:
-      'Read an attribute from the first element matching a selector. Returns { exists, value }. For reading element text content, use get_text. For reading form input values, use get_value.',
+      'Read an attribute from the first matching element. Pass `selector` or `ref`.',
     inputSchema: {
       type: 'object',
       properties: {
         selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot.' },
         name: { type: 'string', description: 'Attribute name, e.g. "href", "aria-label".' },
       },
-      required: ['selector', 'name'],
+      required: ['name'],
     },
-    handler: async ({ selector, name }) => {
+    handler: async ({ selector, ref, name }) => {
       requireApp()
-      const loc = win.locator(selector)
+      const sel = resolveSelector(selector, ref)
+      const loc = win.locator(sel)
       const count = await loc.count()
       if (count === 0) return ok({ exists: false, value: null })
       const value = await loc.first().getAttribute(name)
@@ -1006,15 +1204,18 @@ const tools = {
 
   get_value: {
     description:
-      'Read the current value of a form input, textarea, or select matching a selector. Returns { exists, value }. For checkboxes/radios, see `is_checked` via eval_renderer (or use get_attribute for type-specific attrs).',
+      'Read the current value of a form input, textarea, or select. Pass `selector` or `ref`.',
     inputSchema: {
       type: 'object',
-      properties: { selector: { type: 'string' } },
-      required: ['selector'],
+      properties: {
+        selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot.' },
+      },
     },
-    handler: async ({ selector }) => {
+    handler: async ({ selector, ref }) => {
       requireApp()
-      const loc = win.locator(selector)
+      const sel = resolveSelector(selector, ref)
+      const loc = win.locator(sel)
       const count = await loc.count()
       if (count === 0) return ok({ exists: false, value: null })
       const value = await loc.first().inputValue()
@@ -1024,15 +1225,18 @@ const tools = {
 
   get_bbox: {
     description:
-      'Get the bounding box of the first element matching a selector, in CSS pixels. Returns { exists, box: {x, y, width, height} }. Useful before dragging or clicking at a specific offset, without having to eval getBoundingClientRect.',
+      'Get the bounding box of the first matching element in CSS pixels. Pass `selector` or `ref`. Useful before drag operations.',
     inputSchema: {
       type: 'object',
-      properties: { selector: { type: 'string' } },
-      required: ['selector'],
+      properties: {
+        selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot.' },
+      },
     },
-    handler: async ({ selector }) => {
+    handler: async ({ selector, ref }) => {
       requireApp()
-      const loc = win.locator(selector)
+      const sel = resolveSelector(selector, ref)
+      const loc = win.locator(sel)
       const count = await loc.count()
       if (count === 0) return ok({ exists: false, box: null })
       const box = await loc.first().boundingBox()
@@ -1462,18 +1666,19 @@ const tools = {
 
   get_text: {
     description:
-      'Read the text content of an element matching a selector. Uses Playwright locators so it accepts the full selector engine (CSS, text=, role=, :has-text(), etc). If multiple elements match, returns the first. Does not wait — pair with wait_for_selector if needed.',
+      'Read the text content of the first matching element. Pass `selector` or `ref`. Does not wait.',
     inputSchema: {
       type: 'object',
       properties: {
         selector: { type: 'string' },
+        ref: { type: 'number', description: 'Ref from snapshot.' },
         trim: { type: 'boolean', description: 'Default true.' },
       },
-      required: ['selector'],
     },
-    handler: async ({ selector, trim = true }) => {
+    handler: async ({ selector, ref, trim = true }) => {
       requireApp()
-      const loc = win.locator(selector)
+      const sel = resolveSelector(selector, ref)
+      const loc = win.locator(sel)
       const count = await loc.count()
       if (count === 0) return ok({ exists: false, text: null })
       const raw = (await loc.first().textContent()) || ''
