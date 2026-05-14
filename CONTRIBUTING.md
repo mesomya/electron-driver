@@ -17,6 +17,8 @@ Thanks for taking the time to contribute. This project is small and opinionated;
 
 ## Local development
 
+Requires **Node 22 or later** (Node 20 is EOL; `engine-strict=true` in `.npmrc` enforces this).
+
 ```bash
 git clone https://github.com/mesomya/electron-driver
 cd electron-driver
@@ -37,7 +39,9 @@ To test against a real Electron app: register the local `index.mjs` in your MCP 
 
 ## Testing changes
 
-There's no formal test suite yet. Validate your change by:
+CI runs a boot smoke test on every push/PR across Node 22 and 24 on Ubuntu, Windows, and macOS (6 matrix runners). The test boots the server, verifies the ready banner appears on stderr, and confirms clean exit on stdin close. It also runs `npm audit` and Trivy secret scanning.
+
+For manual validation of a change:
 
 1. Booting the server: `node index.mjs`
 2. Driving a real Electron app with a fresh change via an MCP client (Claude Code, Claude Desktop, Cursor)

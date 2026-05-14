@@ -16,7 +16,7 @@ Built on Playwright's experimental `_electron` API. Works with any Electron
 app — React, Vue, Svelte, vanilla — as long as you can point it at a
 compiled main-process entry.
 
-**Status:** v0.3.0. First public release. 38 tools covering real workflows.
+**Status:** v0.7.0. 43 tools covering real workflows.
 
 ## Why this exists
 
@@ -37,7 +37,7 @@ Common use cases:
 
 ## Install
 
-Requires Node 18+ and an Electron app you've already built.
+Requires Node 22+ and an Electron app you've already built.
 
 ```bash
 npm install electron-driver
@@ -98,7 +98,7 @@ without regex-matching prose:
 
 ## Tools
 
-All 38 tools grouped by purpose. Every selector-based tool uses
+All 43 tools grouped by purpose. Every selector-based tool uses
 Playwright's full selector engine: CSS, `text=`, `role=`, `[aria-label=]`,
 `:has-text()`, scoping (`main >> button`), etc.
 
@@ -117,8 +117,10 @@ Viewport is populated from `window.innerWidth/innerHeight`.
 
 ### Capturing
 
-**`screenshot`** — full-page PNG. Pass `name` (without extension) to
-control the filename. Returns `{ path }`.
+**`screenshot`** — full-page PNG, or crop to a specific element. Pass `name`
+(without extension) to control the filename. Pass `selector` (any Playwright
+selector) to crop the screenshot to that element via `locator.screenshot()`.
+Returns `{ path }`.
 
 **`cleanup_screenshots`** — wipe the current session's screenshot directory.
 
@@ -126,6 +128,23 @@ control the filename. Returns `{ path }`.
 debug/pageerror) and main-process stdout/stderr. Rolling 1000-entry buffer.
 Filter by `source` (`renderer`/`main`/`all`), `type`, and `limit`. Pass
 `clear: true` to drain after reading.
+
+**`page_errors`** — uncaught JavaScript exceptions from the renderer page,
+using Playwright's native `page.pageErrors()` API (v1.56+). Returns up to 200
+entries with `message`, `name`, and `stack`. Pass `clear: true` to drain.
+Complement to `console_logs` — specifically for unhandled exceptions.
+
+**`network_requests`** — recent network requests made by the renderer, using
+Playwright's native `page.requests()` API (v1.56+). Returns up to 200 entries
+with `method`, `url`, `resourceType`, and HTTP `status` code. Filter by
+`urlFilter` (URL substring) or `resourceType` (`document`, `script`, `xhr`,
+`fetch`, `image`, `font`, `websocket`, etc).
+
+**`start_screencast`** / **`stop_screencast`** — record the current window as
+a WebM video using Playwright's `page.screencast` API (v1.59+). Pass `name`
+for the output filename. Call `stop_screencast` when done; the file is saved
+to the session screenshots directory. Designed for the agentic video receipt
+pattern: produce a recording of an automation walkthrough as proof of work.
 
 ### Interaction
 
@@ -188,10 +207,11 @@ absolute (`x`, `y`) or delta (`dx`, `dy`).
 
 **`scroll_into_view`** — ensure an element is visible. Safe if already is.
 
-**`drop_file`** — simulate dropping a file onto a target via synthetic
-`DragEvent`s and a reconstructed `File` with `DataTransfer`. Works for apps
-that read the File via web APIs (`FileReader`, `File.text()`, etc). Does
-**not** populate `file.path` — apps relying on `webUtils.getPathForFile()`
+**`drop_file`** — drop a file onto a target element using Playwright's native
+Drop API (`locator.drop()`, Playwright 1.60+). Dispatches trusted `dragenter`,
+`dragover`, and `drop` CDP events with a properly constructed `DataTransfer`.
+Works for apps reading the file via web APIs (`FileReader`, `File.text()`, etc).
+Does **not** populate `file.path` — apps relying on `webUtils.getPathForFile()`
 must use `eval_main` to invoke their own IPC handler directly.
 
 **`set_input_files`** — the correct way to test file upload UI. Sets files
@@ -237,9 +257,12 @@ buttons exist on this screen". Capped at 50 by default; tune via `limit`.
 and bounding box. Returns `{ focused: false }` if nothing meaningful has
 focus.
 
-**`accessibility_snapshot`** — capture the ARIA tree as JSON. Useful for a11y
-audits and finding elements by role. Pass `interestingOnly: false` to
-include every node. Pass `root` to snapshot a subtree.
+**`accessibility_snapshot`** — capture the ARIA accessibility tree as a
+YAML-formatted string. Uses `page.ariaSnapshot()` (Playwright 1.59+;
+`boxes` option requires 1.60+; the removed `page.accessibility` API is not
+used). Pass `root` to snapshot a subtree. Pass `boxes: true` to include each
+element's bounding box (`[box=x,y,width,height]`) — optimal for AI agents
+correlating a11y info with spatial position.
 
 ### Multi-window
 
@@ -397,10 +420,9 @@ it just makes them convenient for the agent to use.
   handles them — but are less battle-tested. Bug reports welcome.
 - `switch_window` routes subsequent calls to the selected window, but the
   console-log buffer is populated from the initial window. Multi-window
-  console capture is a planned v0.4 item.
+  console capture is a known gap.
 - `drop_file` does not populate `file.path`. Apps using
   `webUtils.getPathForFile()` must use `eval_main` with their own IPC.
-- No built-in network-request capture yet — planned for v0.4.
 
 ## Implementation notes
 
