@@ -14,7 +14,8 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { _electron as electron } from 'playwright'
-import { mkdirSync, rmSync, existsSync, appendFileSync, readFileSync } from 'node:fs'
+import { mkdirSync, rmSync, existsSync, appendFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 
@@ -155,10 +156,11 @@ function resolveElectronBinary(projectDir, userExecPath) {
 function rewriteErrorForTool(e, toolName) {
   const message = e?.message || String(e)
   // Playwright prefixes errors with things like `page.evaluate: ...`,
-  // `locator.click: ...`, `page.waitForSelector: ...`. Replace the prefix
-  // with `<toolName>: `.
+  // `locator.click: ...`, `page.waitForSelector: ...`, `app.evaluate: ...`.
+  // Replace the prefix with `<toolName>: ` so the user sees the driver tool
+  // name, not the internal Playwright/Electron API surface.
   return message.replace(
-    /^(page|locator|frame|elementHandle|keyboard|mouse)\.[a-zA-Z]+:\s*/,
+    /^(page|locator|frame|elementHandle|keyboard|mouse|app)\.[a-zA-Z]+:\s*/,
     `${toolName}: `
   )
 }
@@ -542,11 +544,19 @@ const tools = {
 
       // Wire up console capture — renderer and main process both.
       win.on('console', (msg) => {
-        pushConsole({
+        const loc = msg.location()
+        const entry = {
           source: 'renderer',
           type: msg.type(),
           text: msg.text(),
-        })
+        }
+        // loc.line / loc.column added in Playwright 1.60 (lineNumber/columnNumber deprecated).
+        // Include file+line when available — helps agents identify the source of a log.
+        if (loc.url) {
+          entry.file = loc.url
+          entry.line = loc.line
+        }
+        pushConsole(entry)
       })
       win.on('pageerror', (e) => {
         pushConsole({ source: 'renderer', type: 'error', text: String(e?.message || e) })
@@ -774,20 +784,25 @@ const tools = {
 
   screenshot: {
     description:
-      'Capture a full-page PNG of the current window. Returns the absolute path. Pass `name` to control the filename (without extension).',
+      'Capture a PNG of the current window. Returns the absolute path. Pass `name` to control the filename (without extension). Pass `selector` to crop the screenshot to a specific element using Playwright\'s full selector engine.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'Filename without extension.' },
-        fullPage: { type: 'boolean', description: 'Default true.' },
+        fullPage: { type: 'boolean', description: 'Capture full scrollable page. Default true. Ignored when selector is given.' },
+        selector: { type: 'string', description: 'Optional Playwright selector. When given, crops the screenshot to the first matching element.' },
       },
     },
-    handler: async ({ name, fullPage = true }) => {
+    handler: async ({ name, fullPage = true, selector }) => {
       requireApp()
       shotCounter++
       const safeName = name || `shot-${String(shotCounter).padStart(3, '0')}`
       const file = path.join(shotsDir, `${safeName}.png`)
-      await win.screenshot({ path: file, fullPage })
+      if (selector) {
+        await win.locator(selector).first().screenshot({ path: file })
+      } else {
+        await win.screenshot({ path: file, fullPage })
+      }
       return ok({ path: file })
     },
   },
@@ -832,7 +847,6 @@ const tools = {
             'Click at an offset inside the element (default is centre). Useful for hitting specific sub-regions.',
         },
       },
-      required: ['selector'],
     },
     handler: async ({
       selector,
@@ -973,7 +987,6 @@ const tools = {
             'Skip actionability checks (default false). Set true if an overlay is intercepting pointer events.',
         },
       },
-      required: ['selector'],
     },
     handler: async ({ selector, ref, timeoutMs, force = false }) => {
       requireApp()
@@ -1020,14 +1033,13 @@ const tools = {
       assertPoint('to', to)
 
       // Helper to read bounding box of the detect target.
+      // Uses Playwright's locator API so detectSelector supports the full
+      // selector engine (text=, role=, :has-text(), etc), not just CSS.
       const readBox = async () => {
         if (!detectSelector) return null
-        return await win.evaluate((sel) => {
-          const el = document.querySelector(sel)
-          if (!el) return null
-          const r = el.getBoundingClientRect()
-          return { x: r.x, y: r.y, width: r.width, height: r.height }
-        }, detectSelector)
+        const loc = win.locator(detectSelector).first()
+        if ((await loc.count()) === 0) return null
+        return await loc.boundingBox()
       }
 
       const didMove = (before, after) =>
@@ -1296,10 +1308,13 @@ const tools = {
     handler: async ({ selector, limit = 50, attributes }) => {
       requireApp()
       const extraAttrs = attributes || ['aria-label', 'role', 'href', 'title']
-      const result = await win.evaluate(
-        ({ sel, limit, attrs }) => {
-          const els = Array.from(document.querySelectorAll(sel)).slice(0, limit)
-          return els.map((el) => {
+      // Use Playwright's full locator engine so the selector supports text=, role=,
+      // :has-text(), and every other Playwright syntax — not just CSS.
+      const locs = await win.locator(selector).all()
+      const sliced = locs.slice(0, limit)
+      const result = await Promise.all(
+        sliced.map((loc) =>
+          loc.evaluate((el, attrs) => {
             const r = el.getBoundingClientRect()
             const obj = {
               tag: el.tagName,
@@ -1313,9 +1328,8 @@ const tools = {
               if (v != null) obj[a] = v
             }
             return obj
-          })
-        },
-        { sel: selector, limit, attrs: extraAttrs }
+          }, extraAttrs)
+        )
       )
       return ok({ count: result.length, elements: result })
     },
@@ -1539,33 +1553,33 @@ const tools = {
 
   accessibility_snapshot: {
     description:
-      'Capture the accessibility tree of the current page as JSON. Useful for testing screen-reader behaviour, finding elements by role, or auditing for missing ARIA labels. Optionally pass `interestingOnly: false` to include every node, not just interesting ones.',
+      'Capture the ARIA accessibility tree of the current page as a YAML-formatted string. Useful for a11y audits and finding elements by role, name, or label. Pass `root` to snapshot a subtree. Pass `boxes: true` to append each element\'s bounding box — ideal for AI agents that need to combine a11y info with spatial positioning. Uses `page.ariaSnapshot()` (Playwright 1.59+; `boxes` option requires 1.60+). The removed `page.accessibility` API is not used.',
     inputSchema: {
       type: 'object',
       properties: {
-        interestingOnly: {
-          type: 'boolean',
-          description:
-            'Filter to interactive/labelled nodes only. Default true (matches Playwright default).',
-        },
         root: {
           type: 'string',
           description:
-            'Optional selector. If given, snapshot is rooted at that element instead of the full page.',
+            'Optional Playwright selector. If given, snapshot is rooted at the first matching element instead of the full page.',
+        },
+        boxes: {
+          type: 'boolean',
+          description:
+            'Append bounding box coordinates `[box=x,y,width,height]` to each ARIA node. Default false. Useful for AI agents correlating a11y info with visual position.',
         },
       },
     },
-    handler: async ({ interestingOnly = true, root }) => {
+    handler: async ({ root, boxes = false } = {}) => {
       requireApp()
-      let rootHandle
+      let snapshot
       if (root) {
-        rootHandle = await win.locator(root).first().elementHandle()
-        if (!rootHandle) return err(`No element matches selector: ${root}`, 'NOT_FOUND')
+        const loc = win.locator(root).first()
+        const count = await loc.count()
+        if (count === 0) return err(`No element matches selector: ${root}`, 'NOT_FOUND')
+        snapshot = await loc.ariaSnapshot({ boxes })
+      } else {
+        snapshot = await win.ariaSnapshot({ boxes })
       }
-      const snapshot = await win.accessibility.snapshot({
-        interestingOnly,
-        root: rootHandle,
-      })
       return ok({ snapshot })
     },
   },
@@ -1771,7 +1785,9 @@ const tools = {
       },
     },
     handler: async ({ limit = 200, source = 'all', type, clear = false }) => {
-      requireApp()
+      // Do NOT require a running session. The buffer persists after stop_app so
+      // agents can read crash logs and post-mortem output. An empty buffer
+      // before any session has been started is valid — returns empty entries.
       let entries = consoleBuffer
       if (source !== 'all') entries = entries.filter((e) => e.source === source)
       if (type) entries = entries.filter((e) => e.type === type)
@@ -1783,7 +1799,7 @@ const tools = {
 
   drop_file: {
     description:
-      'Simulate dropping a file onto a target element by dispatching synthetic drag/drop events with a DataTransfer containing the file contents. Works for apps that read File via web APIs (FileReader, File.text, etc.). Does NOT populate file.path — apps that rely on webUtils.getPathForFile() or legacy file.path must use eval_main to invoke their IPC directly.',
+      'Drop a file onto a target element via Playwright\'s native Drop API (Chromium CDP pipeline, Playwright 1.60+). Dispatches real `dragenter`, `dragover`, and `drop` events with a properly constructed `DataTransfer` containing the file. Works for apps that read the dropped file via web APIs (FileReader, File.text(), etc.). Does NOT populate `file.path` — apps relying on `webUtils.getPathForFile()` must use `eval_main` to invoke their IPC handler directly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1791,7 +1807,7 @@ const tools = {
         selector: {
           type: 'string',
           description:
-            'CSS selector of the drop target. Defaults to document.body.',
+            'Playwright selector of the drop target. Defaults to body.',
         },
         mimeType: {
           type: 'string',
@@ -1803,44 +1819,181 @@ const tools = {
     handler: async ({ filePath, selector = 'body', mimeType = 'text/plain' }) => {
       requireApp()
       if (!path.isAbsolute(filePath)) {
-        return err(`filePath must be absolute. Got: ${filePath}`)
+        return err(`filePath must be absolute. Got: ${filePath}`, 'BAD_ARGUMENT')
       }
       if (!existsSync(filePath)) {
-        return err(`File not found: ${filePath}`)
+        return err(`File not found: ${filePath}`, 'FILE_NOT_FOUND')
       }
-      const contents = readFileSync(filePath).toString('base64')
+      const buffer = await readFile(filePath)
       const name = path.basename(filePath)
-      const delivered = await win.evaluate(
-        async ({ selector, b64, name, mimeType }) => {
-          const target = document.querySelector(selector)
-          if (!target) return { ok: false, error: `No element matches selector: ${selector}` }
-          const bin = atob(b64)
-          const bytes = new Uint8Array(bin.length)
-          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-          const file = new File([bytes], name, { type: mimeType })
-          const dt = new DataTransfer()
-          dt.items.add(file)
-          const rect = target.getBoundingClientRect()
-          const cx = rect.x + rect.width / 2
-          const cy = rect.y + rect.height / 2
-          const common = {
-            bubbles: true,
-            cancelable: true,
-            clientX: cx,
-            clientY: cy,
-            dataTransfer: dt,
-          }
-          target.dispatchEvent(new DragEvent('dragenter', common))
-          target.dispatchEvent(new DragEvent('dragover', common))
-          target.dispatchEvent(new DragEvent('drop', common))
-          return { ok: true, targetTag: target.tagName, name }
-        },
-        { selector, b64: contents, name, mimeType }
-      )
-      if (!delivered?.ok) return err(delivered?.error || 'drop_file failed')
-      return ok(delivered)
+      await win.locator(selector).drop({
+        files: { name, mimeType, buffer },
+      })
+      return ok({ name, selector })
     },
   },
+
+  page_errors: {
+    description:
+      'Return uncaught JavaScript exceptions thrown by the renderer page since session start (up to 200, tracked by Playwright since v1.56). Each entry has message, name, and stack. Pass clear: true to drain after reading.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        clear: { type: 'boolean', description: 'If true, clear the stored errors after reading.' },
+      },
+    },
+    handler: async ({ clear = false } = {}) => {
+      requireApp()
+      const errors = await win.pageErrors()
+      if (clear) await win.clearPageErrors()
+      return ok({
+        count: errors.length,
+        errors: errors.map((e) => ({ message: e.message, name: e.name, stack: e.stack || null })),
+      })
+    },
+  },
+
+  network_requests: {
+    description:
+      'Return recent network requests made by the renderer page (up to 200, tracked by Playwright v1.56+ since session start). Each entry includes method, URL, resource type, and HTTP status code. Optionally filter by URL substring or resource type (document, script, stylesheet, image, font, xhr, fetch, websocket, other).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        urlFilter: {
+          type: 'string',
+          description: 'Optional substring to filter request URLs.',
+        },
+        resourceType: {
+          type: 'string',
+          description: 'Optional resource type filter: document, script, stylesheet, image, font, xhr, fetch, websocket, other, etc.',
+        },
+      },
+    },
+    handler: async ({ urlFilter, resourceType } = {}) => {
+      requireApp()
+      const reqs = await win.requests()
+      let result = await Promise.all(
+        reqs.map(async (req) => {
+          let status = null
+          try {
+            const resp = await req.response()
+            if (resp) status = resp.status()
+          } catch {}
+          return {
+            method: req.method(),
+            url: req.url(),
+            resourceType: req.resourceType(),
+            status,
+          }
+        })
+      )
+      if (urlFilter) result = result.filter((r) => r.url.includes(urlFilter))
+      if (resourceType) result = result.filter((r) => r.resourceType === resourceType)
+      return ok({ count: result.length, requests: result })
+    },
+  },
+
+  start_screencast: {
+    description:
+      'Start recording the current window as a WebM video (Playwright 1.59+ screencast API). Designed for the agentic video receipt pattern — record a walkthrough as proof of work. Saves to the session screenshots directory. Call stop_screencast when done.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Output filename without extension. Defaults to "screencast".',
+        },
+      },
+    },
+    handler: async ({ name = 'screencast' } = {}) => {
+      requireApp()
+      const file = path.join(shotsDir, `${name}.webm`)
+      await win.screencast.start({ path: file })
+      return ok({ path: file })
+    },
+  },
+
+  stop_screencast: {
+    description:
+      'Stop the active screencast recording started by start_screencast and flush the WebM file to disk. Returns the path to the saved file.',
+    inputSchema: { type: 'object', properties: {} },
+    handler: async () => {
+      requireApp()
+      await win.screencast.stop()
+      return ok({ stopped: true })
+    },
+  },
+}
+
+// ---- MCP tool annotations -----------------------------------------------
+//
+// Compliant with the MCP 2025-03-26 ToolAnnotations schema.
+// These are *hints* — untrusted unless coming from a trusted server.
+//
+// Defaults per spec (important — not setting a field means the default applies):
+//   readOnlyHint:    false  → tool may modify its environment
+//   destructiveHint: true   → tool may perform destructive updates (DANGEROUS default)
+//   idempotentHint:  false  → repeated calls may have cumulative effects
+//   openWorldHint:   true   → tool may interact with external world (DANGEROUS default)
+//
+// We explicitly set all four on every tool so agent hosts get precise information
+// rather than relying on the risky defaults.
+const toolAnnotations = {
+  // Lifecycle
+  start_app:           { title: 'Launch Electron App',              readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true  },
+  stop_app:            { title: 'Stop App',                          readOnlyHint: false, destructiveHint: true,  idempotentHint: true,  openWorldHint: true  },
+  info:                { title: 'App Info',                          readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  // Snapshot
+  snapshot:            { title: 'DOM Snapshot with Refs',            readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Capturing
+  screenshot:          { title: 'Take Screenshot',                   readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  cleanup_screenshots: { title: 'Delete Session Screenshots',        readOnlyHint: false, destructiveHint: true,  idempotentHint: true,  openWorldHint: false },
+  console_logs:        { title: 'Read Console Logs',                 readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Interaction
+  click:               { title: 'Click Element',                     readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  type:                { title: 'Fill Input Field',                  readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  keyboard_type:       { title: 'Type Text via Keyboard',            readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  press:               { title: 'Press Key or Chord',                readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  press_sequence:      { title: 'Type Text Sequence',                readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  hover:               { title: 'Hover over Element',                readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  drag:                { title: 'Drag between Points',               readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  clear_input:         { title: 'Clear Input Field',                 readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  select_option:       { title: 'Select Dropdown Option',            readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  check:               { title: 'Check Checkbox or Radio',           readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  uncheck:             { title: 'Uncheck Checkbox',                  readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  scroll:              { title: 'Scroll Page or Element',            readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  scroll_into_view:    { title: 'Scroll Element into View',          readOnlyHint: false, destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  set_input_files:     { title: 'Set File Input',                    readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  drop_file:           { title: 'Drop File onto Element',            readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Waiting
+  wait:                { title: 'Fixed Pause',                       readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  wait_for_selector:   { title: 'Wait for Element State',            readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  wait_for:            { title: 'Wait for JS Predicate',             readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Checking & reading
+  exists:              { title: 'Check Element Exists',              readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  get_text:            { title: 'Get Element Text',                  readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  get_attribute:       { title: 'Get Element Attribute',             readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  get_value:           { title: 'Get Input Value',                   readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  get_bbox:            { title: 'Get Bounding Box',                  readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  get_computed_style:  { title: 'Get Computed CSS Style',            readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  elements_list:       { title: 'List Matching Elements',            readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  focused_element:     { title: 'Get Focused Element',               readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  // A11y
+  accessibility_snapshot: { title: 'ARIA Accessibility Snapshot',   readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  // Multi-window
+  windows_list:        { title: 'List Open Windows',                 readOnlyHint: true,  destructiveHint: false, idempotentHint: true,  openWorldHint: false },
+  switch_window:       { title: 'Switch Active Window',              readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Dialogs
+  dialog_handler:      { title: 'Install Dialog Auto-Responder',     readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Evaluation — these are the most powerful and most dangerous tools
+  eval_renderer:       { title: 'Evaluate JS in Renderer',           readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
+  eval_main:           { title: 'Evaluate JS in Main Process',       readOnlyHint: false, destructiveHint: true,  idempotentHint: false, openWorldHint: true  },
+  // Diagnostics (native Playwright APIs)
+  page_errors:         { title: 'Get Renderer Page Errors',          readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  network_requests:    { title: 'Get Network Requests',              readOnlyHint: true,  destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  // Screencast
+  start_screencast:    { title: 'Start Video Recording',             readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  stop_screencast:     { title: 'Stop Video Recording',              readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
 }
 
 // ---- MCP wiring --------------------------------------------------------
@@ -1871,7 +2024,8 @@ electron-driver lets you drive an Electron desktop app — click, type, drag, sc
 - **Read DOM state:** get_text, get_attribute, get_value, get_bbox, get_computed_style, exists — all accept ref or selector
 - **Forms:** type (fill), keyboard_type (real keystrokes), select_option, check/uncheck, clear_input, set_input_files
 - **Wait for state:** wait_for_selector or wait_for (predicate) — prefer these over fixed wait()
-- **Debug:** console_logs, eval_renderer, eval_main
+- **Debug:** console_logs, page_errors, network_requests, eval_renderer, eval_main
+- **Record session:** start_screencast → stop_screencast (saves .webm to screenshots dir)
 - **Native dialogs are invisible** — use eval_main to invoke IPC handlers directly, or dialog_handler for JS alert/confirm/prompt
 - **Multi-window:** windows_list → switch_window by index or title
 
@@ -1884,16 +2038,21 @@ electron-driver lets you drive an Electron desktop app — click, type, drag, sc
 `.trim()
 
 const server = new Server(
-  { name: 'electron-driver', version: '0.3.0' },
+  { name: 'electron-driver', version: '0.7.0' },
   { capabilities: { tools: {} }, instructions: SERVER_INSTRUCTIONS }
 )
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: Object.entries(tools).map(([name, t]) => ({
-    name,
-    description: t.description,
-    inputSchema: t.inputSchema,
-  })),
+  tools: Object.entries(tools).map(([name, t]) => {
+    const entry = {
+      name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    }
+    const ann = toolAnnotations[name]
+    if (ann) entry.annotations = ann
+    return entry
+  }),
 }))
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -1907,7 +2066,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     return result
   } catch (e) {
     const rewritten = rewriteErrorForTool(e, name)
-    const code = e?.code || (/^timeout/i.test(rewritten) ? 'TIMEOUT' : 'ERROR')
+    // Match 'timeout' anywhere in the message, not just at the start — after
+    // rewriteErrorForTool the string starts with the tool name (e.g. 'click: Timeout ...').
+    const code = e?.code || (/timeout/i.test(rewritten) ? 'TIMEOUT' : 'ERROR')
     log('error', { tool: name, error: rewritten, code })
     return err(rewritten, code)
   }
@@ -1936,4 +2097,4 @@ process.on('exit', () => {
 
 const transport = new StdioServerTransport()
 await server.connect(transport)
-process.stderr.write('electron-driver MCP server v0.3.0 ready\n')
+process.stderr.write('electron-driver MCP server v0.7.0 ready\n')

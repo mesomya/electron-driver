@@ -1,6 +1,6 @@
 {
   "name": "electron-driver",
-  "version": "0.3.0",
+  "version": "0.7.0",
   "description": "MCP server that lets AI agents drive Electron apps — click, type, drag, screenshot, eval JS in the renderer or main process, capture console logs, handle multi-window apps, and more.",
   "type": "module",
   "bin": {
@@ -11,7 +11,8 @@
     "index.mjs",
     "README.md",
     "LICENSE",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "server.json"
   ],
   "scripts": {
     "start": "node index.mjs"
@@ -43,10 +44,10 @@
     "url": "https://github.com/mesomya/electron-driver/issues"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
-    "playwright": "^1.59.1"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright": "^1.60.0"
   }
 }

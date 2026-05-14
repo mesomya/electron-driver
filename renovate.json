@@ -1,0 +1,21 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:best-practices"],
+  "labels": ["dependencies"],
+  "osvVulnerabilityAlerts": true,
+  "semanticCommits": "enabled",
+  "packageRules": [
+    {
+      "description": "Auto-merge patch and minor npm updates after stability window",
+      "matchDatasources": ["npm"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true
+    },
+    {
+      "description": "Require Dependency Dashboard approval for major npm updates",
+      "matchDatasources": ["npm"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
