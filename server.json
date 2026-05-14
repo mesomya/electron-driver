@@ -1,21 +1,21 @@
 {
   "name": "io.github.mesomya/electron-driver",
   "display_name": "electron-driver",
-  "description": "Drive Electron desktop apps from AI agents — click, type, drag, screenshot, eval JS in the renderer or main process, capture console logs, handle multi-window apps, and more. 39 tools, Playwright-powered, works with any Electron app.",
+  "description": "Drive Electron desktop apps from AI agents — click, type, drag, screenshot, eval JS in the renderer or main process, capture console logs, handle multi-window apps, and more. 43 tools, Playwright-powered, works with any Electron app.",
   "repository": {
     "type": "git",
     "url": "https://github.com/mesomya/electron-driver"
   },
   "version_detail": {
-    "version": "0.3.0",
-    "release_date": "2026-04-12",
+    "version": "0.7.0",
+    "release_date": "2026-05-12",
     "is_latest": true
   },
   "packages": [
     {
       "registry_name": "npm",
       "name": "electron-driver",
-      "version": "0.3.0"
+      "version": "0.7.0"
     }
   ],
   "remotes": {
